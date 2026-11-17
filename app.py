@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 import uuid
 from datetime import datetime
@@ -23,7 +24,13 @@ INSCRIPTIONS_HEADERS = [
     "timestamp_iso",
     "heure_affichage",
     "statut",
+    "code_pin",
 ]
+
+
+def hash_pin(insc_id: str, pin: str) -> str:
+    """Hash le code PIN avec l'ID unique de l'inscription."""
+    return hashlib.sha256(f"{insc_id}:{pin}".encode("utf-8")).hexdigest()
 
 
 # --- CONNEXION GOOGLE SHEETS ---
@@ -40,15 +47,22 @@ def get_spreadsheet():
     client = gspread.authorize(creds)
     sh = client.open_by_url(spreadsheet_url)
 
-    # Création automatique des onglets et en-têtes s'ils n'existent pas
+    # Création ou mise à jour automatique des onglets et en-têtes
     for title, headers in [
         ("seances", SEANCES_HEADERS),
         ("inscriptions", INSCRIPTIONS_HEADERS),
     ]:
         try:
             ws = sh.worksheet(title)
-            if not ws.row_values(1):
+            existing_headers = ws.row_values(1)
+            if not existing_headers:
                 ws.append_row(headers, value_input_option="RAW")
+            elif len(existing_headers) < len(headers):
+                # Ajoute les nouvelles colonnes manquantes (ex: code_pin) sans rien effacer
+                if ws.col_count < len(headers):
+                    ws.add_cols(len(headers) - ws.col_count)
+                for idx in range(len(existing_headers), len(headers)):
+                    ws.update_cell(1, idx + 1, headers[idx])
         except gspread.exceptions.WorksheetNotFound:
             ws = sh.add_worksheet(title=title, rows=1000, cols=len(headers))
             ws.append_row(headers, value_input_option="RAW")
@@ -71,7 +85,10 @@ def load_inscriptions() -> pd.DataFrame:
     records = ws.get_all_records(numericise_ignore=["all"])
     if not records:
         return pd.DataFrame(columns=INSCRIPTIONS_HEADERS)
-    return pd.DataFrame(records)
+    df = pd.DataFrame(records)
+    if "code_pin" not in df.columns:
+        df["code_pin"] = ""
+    return df
 
 
 def get_active_inscriptions(seance_id: str) -> pd.DataFrame:
@@ -176,7 +193,6 @@ with tab_inscriptions:
             "Un administrateur doit d'abord créer la prochaine séance dans l'onglet **Administration**."
         )
     else:
-        # Sélection de la séance (s'il y en a plusieurs ouvertes)
         options_seances = {
             row["id_seance"]: f"📅 {row['date_seance']} — {row['titre']}"
             for _, row in seances_ouvertes.iterrows()
@@ -212,21 +228,37 @@ with tab_inscriptions:
             )
         else:
             with st.form("form_inscription", clear_on_submit=True):
-                nom_saisi = st.text_input(
-                    "Votre nom / prénom",
-                    placeholder="Ex : Lucas M.",
-                    max_chars=50,
-                )
+                col_nom, col_pin = st.columns([2, 1])
+                with col_nom:
+                    nom_saisi = st.text_input(
+                        "Votre nom / prénom",
+                        placeholder="Ex : Lucas M.",
+                        max_chars=50,
+                    )
+                with col_pin:
+                    pin_saisi = st.text_input(
+                        "Code PIN (4 chiffres)",
+                        placeholder="Ex : 1234",
+                        max_chars=4,
+                        type="password",
+                        help="Ce code personnel vous sera demandé si vous devez vous désinscrire.",
+                    )
+
                 btn_inscrire = st.form_submit_button(
                     "✅ M'inscrire maintenant", width="stretch"
                 )
 
                 if btn_inscrire:
                     nom_clean = " ".join(nom_saisi.strip().split())
+                    pin_clean = pin_saisi.strip()
+
                     if not nom_clean:
                         st.error("Merci d'entrer votre nom avant de valider.")
+                    elif not (pin_clean.isdigit() and len(pin_clean) == 4):
+                        st.error(
+                            "Le code PIN doit contenir exactement **4 chiffres** (ex : 4829)."
+                        )
                     else:
-                        # Relecture fraîche avant écriture pour limiter les conflits
                         clear_all_caches()
                         actifs_fresh = get_active_inscriptions(selected_seance_id)
                         noms_existants = {
@@ -240,6 +272,8 @@ with tab_inscriptions:
                         else:
                             now = datetime.now(PARIS_TZ)
                             insc_id = uuid.uuid4().hex[:12]
+                            pin_hashed = hash_pin(insc_id, pin_clean)
+
                             ws_insc = get_spreadsheet().worksheet("inscriptions")
                             ws_insc.append_row(
                                 [
@@ -249,11 +283,12 @@ with tab_inscriptions:
                                     now.isoformat(),
                                     now.strftime("%H:%M:%S"),
                                     "INSCRIT",
+                                    pin_hashed,
                                 ],
                                 value_input_option="RAW",
                             )
 
-                            # Vérification post-écriture en cas de clics à la même milliseconde sur la 25e place
+                            # Vérification post-écriture en cas de clics simultanés sur la 25e place
                             clear_all_caches()
                             actifs_after = get_active_inscriptions(selected_seance_id)
                             rang_list = actifs_after.index[
@@ -296,7 +331,9 @@ with tab_inscriptions:
         if attente_df.empty:
             st.caption("Personne en liste d'attente.")
         else:
-            attente_df.insert(0, "Rang attente", [f"#{i}" for i in range(1, len(attente_df) + 1)])
+            attente_df.insert(
+                0, "Rang attente", [f"#{i}" for i in range(1, len(attente_df) + 1)]
+            )
             st.dataframe(
                 attente_df[["Rang attente", "nom", "heure_affichage"]].rename(
                     columns={"nom": "Joueur", "heure_affichage": "Heure d'inscription"}
@@ -305,7 +342,7 @@ with tab_inscriptions:
                 width="stretch",
             )
 
-        # --- DÉSISTEMENT ---
+        # --- DÉSISTEMENT SÉCURISÉ PAR CODE PIN ---
         if not actifs.empty:
             st.divider()
             with st.expander("🚪 Se désinscrire de la séance"):
@@ -321,15 +358,43 @@ with tab_inscriptions:
                     options=list(choix_joueurs.keys()),
                     format_func=lambda k: choix_joueurs[k],
                 )
+                pin_verif = st.text_input(
+                    "Entrez votre code PIN à 4 chiffres :",
+                    max_chars=4,
+                    type="password",
+                    key="pin_desinscription",
+                )
                 confirmer = st.checkbox("Je confirme vouloir libérer ma place")
+
                 if st.button("❌ Confirmer ma désinscription", disabled=not confirmer):
-                    set_inscription_annulee(id_a_annuler)
-                    clear_all_caches()
-                    st.session_state.flash_msg = (
-                        "warning",
-                        "Désinscription prise en compte. La liste a été mise à jour automatiquement !",
-                    )
-                    st.rerun()
+                    pin_verif_clean = pin_verif.strip()
+                    ligne_joueur = actifs[actifs["id_inscription"] == id_a_annuler]
+
+                    if ligne_joueur.empty:
+                        st.error("Ce joueur n'est plus dans la liste.")
+                    else:
+                        stored_hash = str(ligne_joueur.iloc[0]["code_pin"]).strip()
+                        if not stored_hash:
+                            st.error(
+                                "Cette inscription a été faite avant l'ajout du code PIN. "
+                                "Demandez à un administrateur de vous désinscrire."
+                            )
+                        elif not (pin_verif_clean.isdigit() and len(pin_verif_clean) == 4):
+                            st.error("Merci de saisir votre code PIN à 4 chiffres.")
+                        elif not hmac.compare_digest(
+                            hash_pin(id_a_annuler, pin_verif_clean), stored_hash
+                        ):
+                            st.error(
+                                "⛔ Code PIN incorrect ! Seul le joueur inscrit peut se désinscrire."
+                            )
+                        else:
+                            set_inscription_annulee(id_a_annuler)
+                            clear_all_caches()
+                            st.session_state.flash_msg = (
+                                "warning",
+                                "Désinscription prise en compte. La liste a été mise à jour automatiquement !",
+                            )
+                            st.rerun()
 
 # ==========================================
 # ONGLET 2 : ADMINISTRATION
@@ -392,7 +457,7 @@ with tab_admin:
                 st.rerun()
 
         st.divider()
-        st.subheader("📋 Séances existantes")
+        st.subheader("📋 Séances ouvertes & Gestion")
         df_s = load_seances()
         if df_s.empty:
             st.caption("Aucune séance créée.")
@@ -407,4 +472,33 @@ with tab_admin:
                         clear_all_caches()
                         st.rerun()
 
+                    # Option admin pour dépanner un joueur ayant oublié son code PIN
+                    actifs_admin = get_active_inscriptions(row["id_seance"])
+                    if not actifs_admin.empty:
+                        with st.expander(
+                            f"🧹 Désinscrire un joueur ({row['date_seance']}) — si code PIN oublié"
+                        ):
+                            choix_admin = {
+                                r["id_inscription"]: f"#{i + 1} — {r['nom']}"
+                                for i, r in actifs_admin.iterrows()
+                            }
+                            id_admin_annuler = st.selectbox(
+                                "Joueur à retirer :",
+                                options=list(choix_admin.keys()),
+                                format_func=lambda k: choix_admin[k],
+                                key=f"sel_admin_{row['id_seance']}",
+                            )
+                            if st.button(
+                                "❌ Retirer ce joueur",
+                                key=f"btn_admin_del_{row['id_seance']}",
+                            ):
+                                set_inscription_annulee(id_admin_annuler)
+                                clear_all_caches()
+                                st.session_state.flash_msg = (
+                                    "warning",
+                                    f"Joueur retiré par l'administrateur ({choix_admin[id_admin_annuler]}).",
+                                )
+                                st.rerun()
+
+            st.caption("Historique des séances :")
             st.dataframe(df_s.iloc[::-1], hide_index=True, width="stretch")
