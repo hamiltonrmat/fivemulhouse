@@ -136,7 +136,7 @@ if "flash_msg" not in st.session_state:
 
 
 def check_app_password():
-    st.title("⚽ Futsal — Accès privé")
+    st.title("⚽ Five Mulhouse")
     with st.form("login_form"):
         pwd = st.text_input("Mot de passe du groupe", type="password")
         submit = st.form_submit_button("Entrer", width="stretch")
